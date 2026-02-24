@@ -190,17 +190,49 @@ async def convert_markdown_to_audio(
             detail="Markdown file must be UTF-8 encoded",
         ) from exc
 
+    bookly_text = _to_bookly_text(input_text)
+    if not bookly_text:
+        raise HTTPException(status_code=400, detail="Markdown file has no readable content")
+
     base_name = Path(markdown_file.filename).stem
     timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
     output_filename = f"{base_name}-{voice}-{timestamp}.mp3"
     output_path = AUDIO_DIR / output_filename
 
     try:
-        audio_bytes = await generate_speech_bytes(
-            input_text=input_text,
-            voice=voice,
-            narrator=narrator,
-        )
+        estimated_tokens = _estimate_tokens(bookly_text)
+        if estimated_tokens <= TOKENS_PER_CHUNK:
+            audio_bytes = await generate_speech_bytes(
+                input_text=bookly_text,
+                voice=voice,
+                narrator=narrator,
+            )
+        else:
+            chunks = _split_text_by_chars(bookly_text, MAX_CHARS_PER_CHUNK)
+            if not chunks:
+                raise HTTPException(status_code=400, detail="Markdown file has no readable content")
+
+            part_paths: list[Path] = []
+            try:
+                for idx, chunk in enumerate(chunks, start=1):
+                    part_bytes = await generate_speech_bytes(
+                        input_text=chunk,
+                        voice=voice,
+                        narrator=narrator,
+                    )
+                    part_filename = f"{base_name}-{voice}-{timestamp}-part{idx:03d}.mp3"
+                    part_path = AUDIO_DIR / part_filename
+                    part_path.write_bytes(part_bytes)
+                    part_paths.append(part_path)
+
+                audio_bytes = b"".join(path.read_bytes() for path in part_paths)
+            finally:
+                for path in part_paths:
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
+
         output_path.write_bytes(audio_bytes)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Audio generation failed: {exc}") from exc
